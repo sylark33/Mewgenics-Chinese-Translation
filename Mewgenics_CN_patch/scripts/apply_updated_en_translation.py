@@ -19,10 +19,13 @@ def apply_updates(
     combined_path: Path,
     diff_path: Path,
     updated_csv_path: Path | None = None,
+    sync_all_non_zh: bool = False,
+    sync_all_keys: bool = False,
 ) -> tuple[int, int, list[str]]:
     combined_rows, combined_fields = load_csv(combined_path)
     diff_rows, diff_fields = load_csv(diff_path)
     updated_map: dict[str, dict[str, str]] = {}
+    updated_fields: list[str] = []
 
     if updated_csv_path is not None:
         updated_rows, updated_fields = load_csv(updated_csv_path)
@@ -39,9 +42,45 @@ def apply_updates(
             raise ValueError(f"{diff_path} is missing required column: {required}")
 
     combined_map = {row["KEY"]: row for row in combined_rows}
+    diff_map = {row["KEY"]: row for row in diff_rows}
     inserted = 0
     updated = 0
     empty_zh_keys: list[str] = []
+
+    if sync_all_keys:
+        if not updated_map:
+            raise ValueError("--sync-all-keys requires --updated-csv")
+
+        synced_rows: list[dict[str, str]] = []
+        for updated_row in updated_rows:
+            key = updated_row["KEY"]
+            repo_row = combined_map.get(key, {})
+            diff_row = diff_map.get(key, {})
+
+            new_row = {field: "" for field in combined_fields}
+            for field in combined_fields:
+                if field == "zh":
+                    continue
+                if field in updated_fields:
+                    new_row[field] = updated_row.get(field, "")
+
+            zh = normalize_multiline_text(diff_row.get("zh", repo_row.get("zh", "")))
+            if not zh.strip():
+                empty_zh_keys.append(key)
+            new_row["zh"] = zh
+
+            if key in combined_map:
+                updated += 1
+            else:
+                inserted += 1
+            synced_rows.append(new_row)
+
+        with combined_path.open("w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=combined_fields)
+            writer.writeheader()
+            writer.writerows(synced_rows)
+
+        return updated, inserted, empty_zh_keys
 
     for diff_row in diff_rows:
         key = diff_row["KEY"]
@@ -62,15 +101,29 @@ def apply_updates(
             if status != "new_key":
                 raise ValueError(f"Missing existing key in combined.csv: {key}")
             new_row = {field: "" for field in combined_fields}
-            new_row["KEY"] = key
-            new_row["en"] = new_en
+            if updated_map and sync_all_non_zh:
+                for field in combined_fields:
+                    if field == "zh":
+                        continue
+                    if field in updated_fields:
+                        new_row[field] = updated_map[key].get(field, "")
+            else:
+                new_row["KEY"] = key
+                new_row["en"] = new_en
             new_row["zh"] = zh
             combined_rows.append(new_row)
             combined_map[key] = new_row
             inserted += 1
             continue
 
-        target["en"] = new_en
+        if updated_map and sync_all_non_zh:
+            for field in combined_fields:
+                if field == "zh":
+                    continue
+                if field in updated_fields:
+                    target[field] = updated_map[key].get(field, "")
+        else:
+            target["en"] = new_en
         target["zh"] = zh
         updated += 1
 
@@ -94,12 +147,24 @@ def main() -> None:
         default=None,
         help="Optional canonical updated combined.csv to source exact en values from",
     )
+    parser.add_argument(
+        "--sync-all-non-zh",
+        action="store_true",
+        help="When used with --updated-csv, sync every non-zh column from the updated CSV",
+    )
+    parser.add_argument(
+        "--sync-all-keys",
+        action="store_true",
+        help="Sync all keys from the updated CSV while preserving repo zh or diff zh overrides",
+    )
     args = parser.parse_args()
 
     updated, inserted, empty_zh_keys = apply_updates(
         args.combined_csv,
         args.diff_csv,
         args.updated_csv,
+        args.sync_all_non_zh,
+        args.sync_all_keys,
     )
     print(f"updated_existing={updated}")
     print(f"inserted_new={inserted}")
